@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Redis 模式通信链路 —— Big QMT RPC 桥（v0.3.54）</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --panel: #111a2e;
+    --panel-2: #16223b;
+    --stroke: #24314d;
+    --text: #e8eefc;
+    --dim: #9fb0c9;
+    --note: #7c8ba1;
+    --sky: #38bdf8;
+    --emerald: #34d399;
+    --violet: #a78bfa;
+    --amber: #fbbf24;
+    --slate: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 28px 56px;
+    background: radial-gradient(1200px 600px at 15% -10%, #16233d 0%, var(--bg) 55%) fixed;
+    color: var(--text);
+    font: 15px/1.65 "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1560px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: .4px; }
+  h2 { font-size: 19px; margin: 40px 0 12px; padding-left: 12px; border-left: 4px solid var(--sky); }
+  .sub { color: var(--dim); margin: 0 0 4px; }
+  .meta { color: var(--note); font-size: 12.5px; margin-bottom: 22px; }
+  code, .mono { font-family: Consolas, "Cascadia Mono", ui-monospace, monospace; font-size: 12.5px; }
+  code { color: #7dd3fc; background: #0e1a2e; padding: 1px 6px; border-radius: 5px; border: 1px solid #1d2b45; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 20px; margin: 18px 0 14px; }
+  .legend div { display: flex; align-items: center; gap: 8px; color: var(--dim); font-size: 13px; }
+  .swatch { width: 26px; height: 0; border-top: 3px solid; border-radius: 2px; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+
+  .canvas {
+    background: linear-gradient(180deg, #0e1729 0%, #0b1424 100%);
+    border: 1px solid var(--stroke);
+    border-radius: 18px;
+    padding: 10px;
+    overflow-x: auto;
+    box-shadow: 0 24px 60px -30px #000 inset, 0 0 0 1px #0a1120;
+  }
+  svg { display: block; min-width: 1500px; }
+
+  /* ---- SVG text ---- */
+  .lane { font: 600 14px "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; fill: #cbd8ea; letter-spacing: .6px; }
+  .lane-sub { font: 400 11.5px Consolas, monospace; fill: #6f819a; }
+  .t { font: 600 14.5px "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; fill: #e8eefc; }
+  .t-big { font: 700 22px "Segoe UI", system-ui, sans-serif; fill: #e8eefc; }
+  .s { font: 400 12px "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; fill: #a8b8d0; }
+  .k { font: 400 12px Consolas, "Cascadia Mono", monospace; fill: #7dd3fc; }
+  .k-em { fill: #6ee7b7; }
+  .k-vi { fill: #c4b5fd; }
+  .n { font: 400 11.5px "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; fill: #7c8ba1; }
+  .lbl { font: 600 11.5px Consolas, monospace; letter-spacing: .2px; }
+  .badge { font: 700 12px Consolas, monospace; }
+
+  .c-client { fill: #131d33; stroke: #2a3a5c; stroke-width: 1.4; }
+  .c-redis  { fill: #101d2f; stroke: #2b4463; stroke-width: 1.4; }
+  .c-qmt    { fill: #131a2e; stroke: #2f3a5e; stroke-width: 1.4; }
+  .c-gate   { fill: #172038; stroke: #3b4a72; stroke-width: 1.4; }
+  .c-inline { fill: #10202c; stroke: #1e6a86; stroke-width: 1.4; }
+  .c-heavy  { fill: #1b1a2f; stroke: #5b4b9c; stroke-width: 1.4; }
+  .c-main   { fill: #241a2c; stroke: #8b5a8f; stroke-width: 1.4; }
+  .c-send   { fill: #10251f; stroke: #1f7355; stroke-width: 1.4; }
+  .c-src    { fill: #241d12; stroke: #8a6a20; stroke-width: 1.4; }
+  .laneBand { fill: #0c1526; stroke: #1b2740; stroke-width: 1; }
+
+  table { border-collapse: collapse; width: 100%; margin: 14px 0 8px; font-size: 13.5px; }
+  caption { text-align: left; color: var(--dim); font-size: 13px; padding: 4px 0 8px; }
+  th, td { border: 1px solid #223049; padding: 9px 12px; text-align: left; vertical-align: top; }
+  th { background: #121c30; color: #cbd8ea; font-weight: 600; }
+  td.num { text-align: right; font-family: Consolas, monospace; color: #7dd3fc; font-weight: 600; }
+  tr:nth-child(even) td { background: #0f172a; }
+  .tag { display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 11.5px;
+         font-family: Consolas, monospace; border: 1px solid currentColor; }
+  .tag-sky { color: var(--sky); } .tag-em { color: var(--emerald); }
+  .tag-vi { color: var(--violet); } .tag-sl { color: var(--slate); }
+  .callout { border-left: 4px solid var(--amber); background: #171308; padding: 12px 16px;
+             border-radius: 0 10px 10px 0; color: #e6d9b6; margin: 16px 0; }
+  .callout b { color: #ffe9a8; }
+  ol, ul { padding-left: 22px; }
+  li { margin: 5px 0; }
+  footer { color: var(--note); font-size: 12px; margin-top: 34px;
+           border-top: 1px solid #1d2942; padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Redis 模式下和桥通信的链路</h1>
+  <p class="sub">请求怎么进 Redis 有两条路（队列 / 订阅频道）；回包三处同写；服务端再按方法分派到三条执行路；另有一条只推不调的推送路。</p>
+  <p class="meta">对应版本 v0.3.54 · 代码位置：<code>src/bigqmt_signal_trader/transports/redis_transport.py</code>、<code>src/bigqmt_signal_trader/redis_rpc.py</code>、<code>src/bigqmt_signal_trader/exec_events.py</code>、<code>src/bigqmt_signal_trader/quote_push_channel.py</code></p>
+
+  <div class="legend">
+    <div><span class="swatch" style="border-color:#38bdf8"></span>链路① 队列路（默认，唯一在用）</div>
+    <div><span class="swatch" style="border-color:#94a3b8;border-top-style:dashed"></span>链路② 订阅频道路（parity，无调用方）</div>
+    <div><span class="swatch" style="border-color:#34d399"></span>回包：一条 pipeline 写三处</div>
+    <div><span class="swatch" style="border-color:#a78bfa"></span>链路③ 推送路：成交 / 报错回调</div>
+    <div><span class="swatch" style="border-color:#fbbf24"></span>链路③ 推送路：行情</div>
+    <div><span class="swatch" style="border-color:#475569"></span>QMT 内部流转</div>
+  </div>
+
+  <div class="canvas">
+  <svg viewBox="0 0 1500 1200" width="1500" height="1200" role="img"
+       aria-label="Redis 模式下客户端、Redis 与服务端之间的通信链路图">
+    <defs>
+      <marker id="a-sky" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#38bdf8"/></marker>
+      <marker id="a-slate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker>
+      <marker id="a-em" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#34d399"/></marker>
+      <marker id="a-vi" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"/></marker>
+      <marker id="a-am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#fbbf24"/></marker>
+      <marker id="a-dull" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+      <linearGradient id="gTitle" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="#1b2b48"/><stop offset="1" stop-color="#111a2e"/></linearGradient>
+    </defs>
+
+    <!-- lane bands -->
+    <rect class="laneBand" x="30"   y="34" width="320" height="1130" rx="16"/>
+    <rect class="laneBand" x="420"  y="34" width="410" height="1130" rx="16"/>
+    <rect class="laneBand" x="900"  y="34" width="570" height="1130" rx="16"/>
+    <g>
+      <rect x="30" y="34" width="320" height="46" rx="16" fill="url(#gTitle)"/>
+      <rect x="420" y="34" width="410" height="46" rx="16" fill="url(#gTitle)"/>
+      <rect x="900" y="34" width="570" height="46" rx="16" fill="url(#gTitle)"/>
+      <text class="lane" x="52" y="62">客户端进程</text>
+      <text class="lane-sub" x="150" y="62">外部 Python · pip install 的包</text>
+      <text class="lane" x="442" y="62">Redis</text>
+      <text class="lane-sub" x="495" y="62">键空间：list / string / channel / stream</text>
+      <text class="lane" x="922" y="62">QMT 进程（服务端）</text>
+      <text class="lane-sub" x="1078" y="62">Python 3.6.8 · 策略内 · 只有它碰得到 QMT API</text>
+    </g>
+
+    <!-- ================= 客户端 ================= -->
+    <g>
+      <rect class="c-client" x="45" y="200" width="290" height="80" rx="14"/>
+      <text class="t" x="63" y="228">你的脚本 / 策略</text>
+      <text class="k" x="63" y="250">xtdata.get_full_tick()</text>
+      <text class="k" x="63" y="268">xt_trader.order_stock()</text>
+    </g>
+    <g>
+      <rect class="c-client" x="45" y="620" width="290" height="240" rx="14"/>
+      <text class="t" x="63" y="648">等回包：三种键，任一等一个</text>
+      <text class="k k-em" x="63" y="676">BLPOP bigqmt:rpc:respq:{acct}:{rid}</text>
+      <text class="n" x="63" y="694">　　默认路径</text>
+      <text class="k k-em" x="63" y="722">GET bigqmt:rpc:resp:{acct}:{rid}</text>
+      <text class="n" x="63" y="740">　　BLPOP 超时后兜底（60s TTL）</text>
+      <text class="k k-em" x="63" y="768">SUB bigqmt:rpc:resp:{acct}:{rid}</text>
+      <text class="n" x="63" y="786">　　pubsub 客户端才用</text>
+      <text class="n" x="63" y="820">服务端三处同时写，客户端只盯一处</text>
+    </g>
+    <g>
+      <rect class="c-client" x="45" y="920" width="290" height="90" rx="14"/>
+      <text class="t" x="63" y="948">回调分发（4 条 exec 事件）</text>
+      <text class="s" x="63" y="972">on_stock_order · on_stock_trade</text>
+      <text class="s" x="63" y="992">on_order_error · on_cancel_error</text>
+    </g>
+    <g>
+      <rect class="c-client" x="45" y="1040" width="290" height="80" rx="14"/>
+      <text class="t" x="63" y="1068">行情回调</text>
+      <text class="s" x="63" y="1092">subscribe_whole_quote 的 on_data</text>
+    </g>
+
+    <!-- ================= Redis ================= -->
+    <g>
+      <rect class="c-redis" x="430" y="170" width="380" height="80" rx="14"/>
+      <text class="badge" x="446" y="196" fill="#38bdf8">①</text>
+      <text class="t" x="466" y="196">list 请求队列（默认）</text>
+      <text class="k" x="446" y="220">bigqmt:rpc:queue:{account_id}</text>
+      <text class="n" x="446" y="238">客户端 RPUSH · 服务端 BRPOP / LPOP</text>
+    </g>
+    <g>
+      <rect class="c-redis" x="430" y="290" width="380" height="80" rx="14"/>
+      <text class="badge" x="446" y="316" fill="#94a3b8">②</text>
+      <text class="t" x="466" y="316">channel 请求频道</text>
+      <text class="k" x="446" y="340">bigqmt:rpc:req:{account_id}</text>
+      <text class="n" x="446" y="358">客户端 PUBLISH · drain 模式下无人订阅</text>
+    </g>
+    <g>
+      <rect class="c-redis" x="430" y="610" width="380" height="80" rx="14"/>
+      <text class="t" x="446" y="636">回包 · list</text>
+      <text class="k k-em" x="446" y="660">bigqmt:rpc:respq:{account_id}:{rid}</text>
+      <text class="n" x="446" y="678">RPUSH —— 客户端 BLPOP 的主用键</text>
+    </g>
+    <g>
+      <rect class="c-redis" x="430" y="705" width="380" height="80" rx="14"/>
+      <text class="t" x="446" y="731">回包 · string（key）</text>
+      <text class="k k-em" x="446" y="755">bigqmt:rpc:resp:{account_id}:{rid}</text>
+      <text class="n" x="446" y="773">SETEX 60s —— GET 兜底键</text>
+    </g>
+    <g>
+      <rect class="c-redis" x="430" y="800" width="380" height="80" rx="14"/>
+      <text class="t" x="446" y="826">回包 · channel</text>
+      <text class="k k-em" x="446" y="850">bigqmt:rpc:resp:{account_id}:{rid}</text>
+      <text class="n" x="446" y="868">PUBLISH —— pubsub 客户端订阅它</text>
+    </g>
+    <g>
+      <rect class="c-redis" x="430" y="920" width="380" height="90" rx="14"/>
+      <text class="t" x="446" y="946">exec 事件 · stream + 频道（各 4 条）</text>
+      <text class="k k-vi" x="446" y="970">bigqmt:order_events / trade_events</text>
+      <text class="k k-vi" x="446" y="990">bigqmt:order_error_events / cancel_error_events</text>
+    </g>
+    <g>
+      <rect class="c-redis" x="430" y="1040" width="380" height="80" rx="14"/>
+      <text class="t" x="446" y="1066">行情推送频道</text>
+      <text class="k" x="446" y="1090">bigqmt:quote_push:{acct}:{topic}</text>
+      <text class="n" x="446" y="1108">PUBLISH / SUBSCRIBE</text>
+    </g>
+
+    <!-- ================= QMT ================= -->
+    <g>
+      <rect class="c-gate" x="920" y="170" width="260" height="80" rx="14"/>
+      <text class="t" x="938" y="196">取走 · adjust 拍 drain</text>
+      <text class="s" x="938" y="218">LPOP 队列，100ms 一拍</text>
+      <text class="n" x="938" y="238">0.3.51+ 默认（=False）</text>
+    </g>
+    <g>
+      <rect class="c-gate" x="1210" y="170" width="260" height="80" rx="14"/>
+      <text class="t" x="1228" y="196">取走 · 后台收包线程</text>
+      <text class="s" x="1228" y="218">brpop 队列 + pubsub 订阅</text>
+      <text class="n" x="1228" y="238">rpc_background_threads=True</text>
+    </g>
+    <g>
+      <rect class="c-gate" x="920" y="390" width="550" height="60" rx="14"/>
+      <text class="t" x="938" y="416">分派 enqueue_payload()</text>
+      <text class="s" x="1120" y="416">只看方法名 —— 与请求走哪条链路无关</text>
+      <text class="n" x="938" y="438">两道保险保证交易上下文方法永远回不了收包线程（#244 / #252）</text>
+    </g>
+    <g>
+      <rect class="c-inline" x="920" y="490" width="170" height="120" rx="14"/>
+      <text class="t" x="938" y="514">内联</text>
+      <text class="t-big" x="938" y="546" fill="#7dd3fc">108</text>
+      <text class="s" x="980" y="546">个只读方法</text>
+      <text class="n" x="938" y="572">当前线程直接跑</text>
+      <text class="n" x="938" y="592">READ_METHODS 减去</text>
+      <text class="n" x="938" y="606">LISTENER_DEFERRED</text>
+    </g>
+    <g>
+      <rect class="c-heavy" x="1105" y="490" width="180" height="120" rx="14"/>
+      <text class="t" x="1123" y="514">heavy 线程</text>
+      <text class="t-big" x="1123" y="546" fill="#c4b5fd">14</text>
+      <text class="s" x="1165" y="546">个重读</text>
+      <text class="n" x="1123" y="572">bigqmt-rpc-heavy</text>
+      <text class="n" x="1123" y="592">10 个定长 + 4 个按体积</text>
+      <text class="n" x="1123" y="606">仅 drain 模式（#351）</text>
+    </g>
+    <g>
+      <rect class="c-main" x="1300" y="490" width="170" height="120" rx="14"/>
+      <text class="t" x="1318" y="514">adjust 主线程</text>
+      <text class="t-big" x="1318" y="546" fill="#e9a8f0">39</text>
+      <text class="s" x="1360" y="546">个方法</text>
+      <text class="n" x="1318" y="572">34 个交易上下文查询</text>
+      <text class="n" x="1318" y="592">+ 5 个下单 / 撤单</text>
+      <text class="n" x="1318" y="606">回复晚 1~2 拍</text>
+    </g>
+    <g>
+      <rect class="c-send" x="920" y="670" width="550" height="60" rx="14"/>
+      <text class="t" x="938" y="696">publish_response()</text>
+      <text class="s" x="1120" y="696">回包一条 pipeline 同时写三处（#343）</text>
+      <text class="n" x="938" y="718">SETEX key + RPUSH list + PUBLISH channel —— 回包不分链路，谁盯哪一种键谁就拿得到</text>
+    </g>
+    <g>
+      <rect class="c-src" x="920" y="800" width="260" height="70" rx="14"/>
+      <text class="t" x="938" y="826">推送源 · exec 事件</text>
+      <text class="s" x="938" y="850">order_callback / deal_callback 等</text>
+    </g>
+    <g>
+      <rect class="c-src" x="1210" y="800" width="260" height="70" rx="14"/>
+      <text class="t" x="1228" y="826">推送源 · 行情</text>
+      <text class="s" x="1228" y="850">ContextInfo.subscribe_whole_quote</text>
+    </g>
+
+    <!-- ================= 链路① 请求 ================= -->
+    <path d="M335,235 L430,210" fill="none" stroke="#38bdf8" stroke-width="2.6" marker-end="url(#a-sky)"/>
+    <text class="lbl" x="386" y="200" fill="#38bdf8" text-anchor="middle">① RPUSH</text>
+    <path d="M810,205 L920,205" fill="none" stroke="#38bdf8" stroke-width="2.6" marker-end="url(#a-sky)"/>
+    <text class="lbl" x="866" y="196" fill="#38bdf8" text-anchor="middle">LPOP</text>
+    <path d="M600,170 L600,150 L1340,150 L1340,170" fill="none" stroke="#38bdf8" stroke-width="2.6" marker-end="url(#a-sky)"/>
+    <text class="lbl" x="960" y="142" fill="#38bdf8">BRPOP（同一列表，谁先拿到算谁的）</text>
+    <text class="lbl" x="446" y="152" fill="#38bdf8">全部 RPC 都走这条</text>
+
+    <!-- ================= 链路② 请求（dashed） ================= -->
+    <path d="M180,280 L180,330 L430,330" fill="none" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="8 6" marker-end="url(#a-slate)"/>
+    <text class="lbl" x="196" y="322" fill="#94a3b8">② PUBLISH（仓库内无调用方）</text>
+    <path d="M810,345 L1240,345 L1240,250" fill="none" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="8 6" marker-end="url(#a-slate)"/>
+    <text class="lbl" x="856" y="338" fill="#94a3b8">pubsub 订阅（仅后台线程模式）</text>
+
+    <!-- ================= QMT 内部 ================= -->
+    <path d="M1050,250 L1050,390" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#a-dull)"/>
+    <path d="M1340,250 L1340,390" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#a-dull)"/>
+    <path d="M1005,450 L1005,490" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#a-dull)"/>
+    <path d="M1195,450 L1195,490" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#a-dull)"/>
+    <path d="M1385,450 L1385,490" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#a-dull)"/>
+    <path d="M1005,610 L1005,670" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#a-dull)"/>
+    <path d="M1195,610 L1195,670" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#a-dull)"/>
+    <path d="M1385,610 L1385,670" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#a-dull)"/>
+
+    <!-- ================= 回包 ================= -->
+    <path d="M920,680 L860,680 L860,650 L810,650" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#a-em)"/>
+    <path d="M920,700 L838,700 L838,745 L810,745" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#a-em)"/>
+    <path d="M920,720 L852,720 L852,840 L810,840" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#a-em)"/>
+    <text class="lbl" x="862" y="666" fill="#34d399">SETEX</text>
+    <text class="lbl" x="842" y="762" fill="#34d399">RPUSH</text>
+    <text class="lbl" x="856" y="862" fill="#34d399">PUBLISH</text>
+    <path d="M430,650 L335,650" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#a-em)"/>
+    <path d="M430,745 L335,745" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#a-em)"/>
+    <path d="M430,840 L335,840" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#a-em)"/>
+
+    <!-- ================= 推送 ================= -->
+    <path d="M920,835 L880,835 L880,965 L810,965" fill="none" stroke="#a78bfa" stroke-width="2.4" marker-end="url(#a-vi)"/>
+    <text class="lbl" x="884" y="900" fill="#a78bfa">XADD + PUBLISH</text>
+    <path d="M1340,870 L1340,890 L900,890 L900,1065 L810,1065" fill="none" stroke="#fbbf24" stroke-width="2.4" marker-end="url(#a-am)"/>
+    <path d="M430,965 L335,965" fill="none" stroke="#a78bfa" stroke-width="2.6" marker-end="url(#a-vi)"/>
+    <path d="M430,1080 L335,1080" fill="none" stroke="#fbbf24" stroke-width="2.6" marker-end="url(#a-am)"/>
+    <text class="lbl" x="352" y="1010" fill="#a78bfa">订阅 4 条 exec 频道 / stream</text>
+    <text class="lbl" x="352" y="1122" fill="#fbbf24">订阅 quote_push:*:{topic}</text>
+
+    <!-- notes -->
+    <text class="n" x="446" y="1160">maxlen≈2000，可短时重放</text>
+    <text class="n" x="938" y="1160">下载类（download_*）整段持 GIL，刻意留在原地，不上 heavy 线程</text>
+  </svg>
+  </div>
+
+  <h2>链路① 队列路 —— 支持的 RPC：<span style="color:#38bdf8">全部</span></h2>
+  <table>
+    <caption>“全部”指 handler 能认的方法；<code>rpc_allow_order_methods=True</code> 才是下单/撤单放行的开关。</caption>
+    <tr><th>类别</th><th style="width:110px">数量</th><th>代表方法 / 说明</th></tr>
+    <tr><td>只读（<code>READ_METHODS</code>，含归在里面的交易查询）</td><td class="num">142</td>
+        <td><code>get_full_tick</code> · <code>get_market_data_ex</code> · <code>get_financial_data</code> · <code>call_formula</code> · <code>download_history_data2</code> · <code>query_stock_positions</code> · <code>query_credit_detail</code> · <code>subscribe_whole_quote</code>（订阅<b>控制</b>）</td></tr>
+    <tr><td>下单 / 撤单（<code>ORDER_METHODS</code>）</td><td class="num">5</td>
+        <td><code>submit_order</code> · <code>submit_orders_batch</code> · <code>cancel_order</code> · <code>cancel_orders_batch</code> · <code>passorder</code></td></tr>
+    <tr><td>运维类</td><td class="num">—</td>
+        <td><code>ping</code> · <code>get_deployment_info</code> · <code>get_request_outcome</code> · <code>probe_capabilities</code> · <code>probe_order_identity</code> · <code>reload_deployment</code> · <code>reload_status</code></td></tr>
+    <tr><td>别名</td><td class="num">15</td>
+        <td>如 <code>query_stock_positions</code> ↔ <code>get_positions</code>；分派按规范名走</td></tr>
+  </table>
+  <p class="sub">客户端侧入口就是 <code>xtdata.*</code> / <code>xt_trader.*</code> 兼容层，底层都是 <code>RPUSH</code> + <code>BLPOP</code>。</p>
+
+  <h2>链路② 订阅频道路 —— 实际支持：<span style="color:#94a3b8">0 个</span></h2>
+  <p>传输层能装同样的信封，方法集名义上与链路①一样，但两个硬条件让它现在没法用：</p>
+  <ol>
+    <li>服务端只有 <code>rpc_background_threads=True</code> 时才起 <code>_listen_loop</code> 订阅 <code>bigqmt:rpc:req:{账号}</code>；drain 模式（0.3.51+ 默认）下 <code>start_receiving(background_threads=False)</code> 直接返回、不起任何收包线程，而 <code>drain_request_queue</code> 只 <code>LPOP</code> 队列 —— <b>PUBLISH 进去的请求永远没人取，客户端一路等到超时</b>。</li>
+    <li>客户端必须显式 <code>call_redis_rpc(..., transport="pubsub")</code>；仓库里没有任何调用方，只剩 parity 分支和测试。</li>
+  </ol>
+  <div class="callout"><b>结论：</b>别用链路②。要"请求立刻被取走"，改 <code>rpc_background_threads: True</code>（走的是同一个 list，仍是链路①），不是切到频道。</div>
+
+  <h2>回包 —— 不是独立请求路，但服务端固定写三处</h2>
+  <table>
+    <tr><th style="width:210px">写哪</th><th style="width:300px">键</th><th>谁等它</th></tr>
+    <tr><td><code>RPUSH</code> list</td><td><code>bigqmt:rpc:respq:{acct}:{rid}</code></td><td><code>BLPOP</code> —— 默认客户端</td></tr>
+    <tr><td><code>SETEX</code> string（60s）</td><td><code>bigqmt:rpc:resp:{acct}:{rid}</code></td><td><code>GET</code> —— BLPOP 超时兜底</td></tr>
+    <tr><td><code>PUBLISH</code> channel</td><td><code>bigqmt:rpc:resp:{acct}:{rid}</code></td><td>pubsub 客户端订阅</td></tr>
+  </table>
+  <p class="sub">三个写操作合并进一条 pipeline（#343）：分开发的话每一条都要跨线程重新抢一次 GIL，一次回包要付约 8 个 adjust 拍。</p>
+
+  <h2>链路③ 推送路 —— 只推数据，不接受 RPC 调用</h2>
+  <table>
+    <tr><th style="width:340px">频道 / stream</th><th>送到哪个回调</th></tr>
+    <tr><td><code>bigqmt:order_events:{acct}</code></td><td><code>on_stock_order</code></td></tr>
+    <tr><td><code>bigqmt:trade_events:{acct}</code></td><td><code>on_stock_trade</code></td></tr>
+    <tr><td><code>bigqmt:order_error_events:{acct}</code></td><td><code>on_order_error</code>（含 #345 的影子结算拒单）</td></tr>
+    <tr><td><code>bigqmt:cancel_error_events:{acct}</code></td><td><code>on_cancel_error</code></td></tr>
+    <tr><td><code>bigqmt:quote_push:{acct}:{topic}</code></td><td><code>subscribe_whole_quote</code> 的行情数据（topic = <code>exec:order</code> / <code>exec:trade</code> / …）</td></tr>
+  </table>
+  <p class="sub">exec 四路是 <code>XADD</code>（stream，<code>maxlen≈2000</code>，可短时重放）<b>加</b> <code>PUBLISH</code>，两者同名。注意 <code>subscribe_whole_quote</code> / <code>unsubscribe_whole_quote</code> / <code>quote_keepalive</code> / <code>quote_unsubscribe_all</code> 这 4 个是<b>普通 RPC</b>，走链路①；链路③只出数据。</p>
+
+  <h2>服务端三条执行路 —— 真正决定“哪个方法能在哪条路上跑”</h2>
+  <table>
+    <tr><th>执行路</th><th style="width:120px">数量</th><th>覆盖方法</th></tr>
+    <tr><td>当前收包线程<b>内联</b><br><span class="mono"><span class="tag tag-sky">rpc_process_in_listener</span> <span class="tag tag-sky">rpc_listener_methods=("*",)</span></span></td>
+        <td class="num">108</td>
+        <td><code>READ_METHODS</code> − <code>LISTENER_DEFERRED_METHODS</code>：行情、财务、公式、板块、交易日、下载、<code>ping</code>、订阅控制…</td></tr>
+    <tr><td><b>adjust 主线程</b>（deferred，回复晚 1~2 拍）</td>
+        <td class="num">34 + 5</td>
+        <td><code>LISTENER_DEFERRED_METHODS</code>：<code>get_asset</code> · <code>get_positions</code> · <code>query_orders</code> · <code>query_trades</code> · <code>query_credit_*</code> · <code>query_stk_compacts</code> · <code>get_ipo_data</code> · <code>get_history_trade_detail_data</code> …<br>加 <code>ORDER_METHODS</code>：4 个 submit/cancel + <code>passorder</code></td></tr>
+    <tr><td><b>bigqmt-rpc-heavy 工作线程</b><br>（#351，仅 drain 模式）</td>
+        <td class="num">14</td>
+        <td><code>HEAVY_READ_METHODS</code> 10 个：<code>get_financial_data</code> · <code>get_raw_financial_data</code> · <code>get_factor_data</code> · <code>gen_factor_index</code> · <code>call_formula</code> · <code>get_formula_result</code> · <code>get_his_option_list_batch</code> · <code>get_option_detail_data_batch</code> · <code>get_his_index_data</code> · <code>get_longhubang</code><br><code>HEAVY_READ_CODE_METHODS</code> 4 个按体积判：<code>get_ticks</code> · <code>get_market_data</code> · <code>get_market_data_ex</code> · <code>get_local_data</code>（&gt;20 个代码、市场令牌、<code>period="tick"</code>、<code>count=-1</code> 带日期窗口）</td></tr>
+  </table>
+  <p class="sub">两道保险保证交易上下文方法不会跑到错误的线程上：<code>_should_process_in_listener</code> 里对 <code>LISTENER_DEFERRED_METHODS</code> 的二次拦截（#244 / #252），以及 <code>is_heavy_read</code> 先排掉 deferred / order 再判重读 —— 所以 <code>rpc_listener_methods</code> 怎么写都不会把 <code>get_trade_detail_data</code> 系挪出主线程。</p>
+
+  <footer>
+    由 v0.3.54 源码生成 · 键名取自 <code>transports/redis_transport.py</code> 与 <code>exec_events.py</code> 的模板常量 ·
+    方法数量取自 <code>redis_rpc.py</code> 的 <code>READ_METHODS</code> / <code>ORDER_METHODS</code> / <code>LISTENER_DEFERRED_METHODS</code> / <code>HEAVY_READ_*</code>。
+  </footer>
+</div>
+</body>
+</html>
