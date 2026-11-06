@@ -75,6 +75,12 @@
 - **返回**：`dict`，合约详情（名称、上市日、合约乘数、最小变动价位等约 30 个字段）。
 - **实现**：`ContextInfo.get_instrumentdetail(code)`。
 
+### `get_instrument_detail_batch`
+- **参数**：`stockcodes`（list[str]，必填）：合约代码列表；服务端按传入顺序去重后逐只查询。
+- **返回**：`dict`，`{代码: 合约详情}`；单个代码查询失败时该代码返回空字典，不影响其余代码。
+- **实现**：服务端循环 `get_instrument`（原生 SDK 优先、`ContextInfo` 回落），客户端**一次 RPC** 拿到全部结果。
+- **客户端**：`xtdata.get_instrument_detail_batch(stockcodes, timeout_seconds=300.0)`，`timeout_seconds` 为整批的超时。
+
 ---
 
 ## 2.5 全推行情订阅（server 推送，对齐 miniqmt `subscribe_whole_quote`）

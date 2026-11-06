@@ -27,6 +27,13 @@ class _FakeXtData:
         self.calls.append(("get_instrument_detail", (stock_code,)))
         return {"InstrumentName": "浦发银行"}
 
+    def get_instrument_detail_batch(self, stockcodes, timeout_seconds=300.0):
+        self.calls.append((
+            "get_instrument_detail_batch",
+            (tuple(stockcodes), timeout_seconds),
+        ))
+        return {code: {"InstrumentID": code} for code in stockcodes}
+
     def download_history_data(self, stock_code, period, start_time="", end_time="",
                               incrementally=None, dividend_type="none"):
         self.calls.append((
@@ -71,6 +78,22 @@ class XtdataShimSignatureTest(unittest.TestCase):
         detail = shim.get_instrument_detail("600000.SH", False)
         self.assertEqual(detail["InstrumentName"], "浦发银行")
         self.assertEqual(self.fake.calls, [("get_instrument_detail", ("600000.SH",))])
+
+    def test_get_instrument_detail_batch_forwards_codes_and_timeout(self):
+        details = shim.get_instrument_detail_batch(
+            ["600000.SH", "000001.SZ"], timeout_seconds=90)
+        self.assertEqual(
+            details,
+            {
+                "600000.SH": {"InstrumentID": "600000.SH"},
+                "000001.SZ": {"InstrumentID": "000001.SZ"},
+            },
+        )
+        self.assertEqual(
+            self.fake.calls,
+            [("get_instrument_detail_batch",
+              (("600000.SH", "000001.SZ"), 90))],
+        )
 
     def test_download_history_data_passes_dividend_type(self):
         shim.download_history_data(
