@@ -274,7 +274,6 @@ SAFE_B64_DIGIT_ENCODE = str.maketrans("0123456789", "!#$%&()*~?")
 SAFE_B64_DIGIT_DECODE = str.maketrans("!#$%&()*~?", "0123456789")
 MARKET_DATA_METHODS = {
     "get_instrument_type",
-    "get_instrument_detail_batch",
     "get_market_data",
     "get_market_data_ex",
     "get_local_data",
@@ -419,7 +418,6 @@ HEAVY_READ_METHODS = frozenset([
     "get_formula_result",
     "get_his_option_list_batch",
     "get_option_detail_data_batch",
-    "get_instrument_detail_batch",
     "get_his_index_data",
     "get_longhubang",
 ])

@@ -26,10 +26,6 @@ def get_instrument_detail(stock_code, is_detail=False):
     # 接收并忽略, 避免原生双参调用抛 TypeError。
     return _compat.xtdata.get_instrument_detail(stock_code)
 
-def get_instrument_detail_batch(stockcodes, timeout_seconds=300.0):
-    return _compat.xtdata.get_instrument_detail_batch(
-        stockcodes, timeout_seconds=timeout_seconds)
-
 
 def get_instrumentdetail(stock_code):
     return _compat.xtdata.get_instrumentdetail(stock_code)

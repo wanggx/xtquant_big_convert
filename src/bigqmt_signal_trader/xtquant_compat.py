@@ -2357,14 +2357,6 @@ class BigQmtXtData:
     def get_instrument_detail(self, stock_code):
         return self.client.call("get_instrument_detail", {"code": stock_code}) or {}
 
-    def get_instrument_detail_batch(self, stockcodes, timeout_seconds=300.0):
-        """Fetch many instrument details in one RPC; QMT loops over the codes."""
-        return self.client.call(
-            "get_instrument_detail_batch",
-            {"stockcodes": list(stockcodes)},
-            timeout_seconds=timeout_seconds,
-        ) or {}
-
     def get_instrumentdetail(self, stock_code):
         return self.get_instrument_detail(stock_code)
 

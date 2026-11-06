@@ -1222,24 +1222,6 @@ class BigQmtMarketDataProvider:
         )
         return data or {}
 
-    def get_instrument_detail_batch(self, stockcodes):
-        """Return instrument details for many contracts in one RPC request."""
-        if isinstance(stockcodes, (str, bytes)) or not isinstance(
-                stockcodes, (list, tuple)):
-            raise ValueError("stockcodes must be a list or tuple")
-
-        details = {}
-        for value in stockcodes:
-            code = str(value or "").strip()
-            if not code or code in details:
-                continue
-            try:
-                details[code] = self.get_instrument(code) or {}
-            except Exception as exc:
-                log.warning("get_instrument failed for %s: %s", code, exc)
-                details[code] = {}
-        return details
-
     def get_instrument_type(self, code, variety_list=None):
         if hasattr(self.context_info, "get_instrument_type"):
             return self.context_info.get_instrument_type(code, variety_list)

@@ -171,21 +171,6 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(context.instrument_codes, ["000001.SZ"])
         self.assertEqual(data["InstrumentStatus"], 0)
 
-    def test_get_instrument_detail_batch_keeps_results_when_one_code_fails(self):
-        provider = BigQmtMarketDataProvider(FakeContext())
-        provider.get_instrument = lambda code: (
-            {"InstrumentID": code} if code != "bad.SZ"
-            else (_ for _ in ()).throw(RuntimeError("bad contract"))
-        )
-
-        details = provider.get_instrument_detail_batch(
-            ["600000.SH", "bad.SZ", "600000.SH", "000001.SZ"])
-
-        self.assertEqual(details["600000.SH"], {"InstrumentID": "600000.SH"})
-        self.assertEqual(details["bad.SZ"], {})
-        self.assertEqual(details["000001.SZ"], {"InstrumentID": "000001.SZ"})
-        self.assertEqual(len(details), 3)
-
     def test_get_ticks_keys_keep_the_caller_case_for_futures(self):
         """issue #58: futures instrument codes are lower-case ('rb2708.SF'), but
         the keys came back upper-cased, so `code in result` failed for every

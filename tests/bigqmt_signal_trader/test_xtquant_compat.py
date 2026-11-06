@@ -138,11 +138,6 @@ class FakeRpcClient:
             return {codes[0]: {"lastPrice": 10, "bidPrice": [9.9], "askPrice": [10.1]}}
         if method == "get_instrument_detail":
             return {"InstrumentStatus": 0, "code": params.get("code")}
-        if method == "get_instrument_detail_batch":
-            return {
-                code: {"InstrumentStatus": 0, "code": code}
-                for code in params.get("stockcodes", [])
-            }
         if method == "get_market_data_ex":
             if params.get("stock_list") == ["159518.SZ"]:
                 try:
@@ -427,25 +422,6 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(detail["InstrumentStatus"], 0)
         self.assertEqual(sector_codes, ["000001.SZ", "300001.SZ", "600000.SH"])
         self.assertEqual(market_data["600000.SH"]["close"], [10.0])
-
-    def test_instrument_detail_batch_passes_one_rpc_with_timeout(self):
-        xtdata = self._xtdata()
-
-        details = xtdata.get_instrument_detail_batch(
-            ["600000.SH", "000001.SZ"], timeout_seconds=90
-        )
-
-        self.assertEqual(details["600000.SH"]["code"], "600000.SH")
-        self.assertEqual(details["000001.SZ"]["code"], "000001.SZ")
-        self.assertEqual(
-            xtdata.client.calls[-1],
-            (
-                "get_instrument_detail_batch",
-                {"stockcodes": ["600000.SH", "000001.SZ"]},
-                None,
-                90,
-            ),
-        )
 
     def test_market_data_ex_normalizes_bigqmt_stime_to_miniqmt_shape(self):
         try:
