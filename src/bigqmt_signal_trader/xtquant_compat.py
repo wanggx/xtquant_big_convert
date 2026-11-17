@@ -752,8 +752,59 @@ def _warn_partial_market_data(markers):
         log.warning("%s", message)
 
 
+def _restore_arrow_frame(envelope):
+    """Decode one Arrow IPC frame back to a pandas DataFrame.
+
+    ``envelope`` is {"__bigqmt_wire__": "arrow", "header": {...}, "body": <bytes>}
+    as the server's _arrow_encode_frame produced. Returns the DataFrame, or
+    a plain records list if pyarrow is unavailable (parity with the JSON path's
+    graceful degradation in _restore_jsonable).
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+    except Exception:
+        return envelope.get("header") or {}
+    body = envelope.get("body")
+    if not body:
+        return None
+    try:
+        if isinstance(body, str):
+            body = body.encode("latin-1")  # transport may have decoded bytes
+        reader = ipc.open_stream(pa.py_buffer(body))
+        frame = reader.read_pandas()
+        header = envelope.get("header") or {}
+        # If the server preserved a named index, restore it from the carried
+        # column (parity with to_jsonable's reset_index()).
+        idx_name = header.get("index_name")
+        if idx_name and idx_name in frame.columns:
+            frame = frame.set_index(idx_name)
+        return frame
+    except Exception:
+        return envelope.get("header") or {}
+
+
+def _restore_arrow_envelope(envelope):
+    """Decode a {code: DataFrame} answer sent as Arrow IPC frames.
+
+    ``envelope`` is {"__bigqmt_wire__": "arrow_envelope", "frames": {code: frame}}.
+    Returns {code: DataFrame} -- the same shape get_market_data_ex returns on
+    the JSON path (callers do ``data.get(code)``), so NO unwrapping even for a
+    single code: the server wraps a bare-DataFrame answer under a synthetic
+    key and the JSON path also answers {code: df} for one code, so a dict is
+    the consistent shape either way.
+    """
+    frames = envelope.get("frames") or {}
+    return {str(code): _restore_arrow_frame(env) for code, env in frames.items()}
+
+
 def _restore_jsonable(value):
     if isinstance(value, dict):
+        wire = value.get("__bigqmt_wire__")
+        if wire == "arrow_envelope":
+            return _restore_arrow_envelope(value)
+        if wire == "arrow":
+            return _restore_arrow_frame(value)
         marker = value.get("__bigqmt_type__")
         if marker == "DataFrame":
             try:
@@ -1488,6 +1539,17 @@ class BigQmtRpcClient:
             or os.environ.get("BIGQMT_RPC_TRANSPORT")
             or "redis"
         ).lower()
+        # Wire encoding for big DataFrame answers (get_market_data_ex, ...).
+        # "json" keeps the historical path byte-identical; "arrow" uses Arrow
+        # IPC binary frames (~16x faster, needs pyarrow on both sides, falls
+        # back to json automatically). The server must agree.
+        self.wire_format = str(
+            merged_redis_config.get("wire_format")
+            or os.environ.get("BIGQMT_WIRE_FORMAT")
+            or "json"
+        ).lower()
+        if self.wire_format not in ("json", "arrow"):
+            self.wire_format = "json"
         self.zmq_config = dict(merged_redis_config.get("zmq") or {})
         self.mysql_config = dict(merged_redis_config.get("mysql") or {})
         self.pipe_config = dict(merged_redis_config.get("pipe") or {})

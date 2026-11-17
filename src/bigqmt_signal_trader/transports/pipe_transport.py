@@ -60,6 +60,111 @@ _STOP_JOIN_SECONDS = 5.0
 DEFAULT_PIPE_NAME = "bigqmt_rpc"
 _PIPE_ROOT = "\\\\.\\pipe\\"
 
+# Binary frame support for wire_format="arrow" (see docs/WIRE_FORMAT_BENCH.md).
+# A JSON frame is unchanged: it starts with b'{' (0x7B). An Arrow frame starts
+# with this magic so the receiver peeks one byte to tell them apart -- no
+# negotiation, no version handshake, and an old peer that does not know the
+# magic simply fails the json.loads and drops the frame (skew-safe: the server
+# only emits Arrow frames when wire_format="arrow", so a mixed fleet keeps
+# JSON peers working by leaving wire_format at its default).
+#
+# Arrow frame layout:
+#   magic      6 bytes  b"BQBIN1"
+#   json_len   4 bytes  uint32 little-endian, length of json_header in bytes
+#   json_header  N bytes UTF-8 JSON: the response with each arrow frame's
+#               "body" (raw bytes) replaced by {"_offset": i, "_length": k},
+#               pointing into the arrow_bodies region that follows.
+#   arrow_bodies  bytes  the concatenation of every frame's Arrow IPC bytes,
+#               in the order the headers reference them.
+_ARROWS_FRAME_MAGIC = b"BQBIN1"
+
+
+def _is_arrow_frame(raw):
+    return isinstance(raw, (bytes, bytearray)) and raw[:len(_ARROWS_FRAME_MAGIC)] == _ARROWS_FRAME_MAGIC
+
+
+def _encode_pipe_frame(response):
+    """Serialize a response for the pipe wire.
+
+    JSON responses (the default, and the arrow path's fallback): json.dumps,
+    identical to every prior release.
+
+    Arrow responses (response["_wire"] == "arrow" and data is an arrow
+    envelope): the binary frame above. The arrow bodies ride after a JSON
+    header that points at them by offset, so the receiver reassembles the
+    envelope without a second serialization of the bytes.
+    """
+    if response.get("_wire") != "arrow":
+        return json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
+    data = response.get("data")
+    if not isinstance(data, dict) or data.get("__bigqmt_wire__") != "arrow_envelope":
+        # _wire=arrow without an envelope should not happen (_encode_response_data
+        # sets _wire=arrow only with an envelope). Trust the invariant: encode
+        # as a normal JSON frame after stripping the marker, so a hypothetical
+        # violation degrades to JSON instead of a malformed binary frame.
+        safe = dict(response)
+        safe.pop("_wire", None)
+        # data may still carry bytes if the invariant broke; default=str keeps
+        # json.dumps from raising, at the cost of stringified bytes (a visible
+        # wrong answer is better than a dropped reply here).
+        return json.dumps(safe, ensure_ascii=False, default=str).encode("utf-8")
+    frames = data.get("frames") or {}
+    header_response = dict(response)
+    header_data = {"__bigqmt_wire__": "arrow_envelope", "frames": {}}
+    bodies = []
+    offset = 0
+    for code, env in frames.items():
+        body = env.get("body") or b""
+        if isinstance(body, str):
+            body = body.encode("latin-1")
+        header_data["frames"][str(code)] = {
+            "__bigqmt_wire__": "arrow",
+            "header": env.get("header"),
+            "_offset": offset,
+            "_length": len(body),
+        }
+        bodies.append(body)
+        offset += len(body)
+    header_response["data"] = header_data
+    json_header = json.dumps(header_response, ensure_ascii=False, default=str).encode("utf-8")
+    import struct
+    return (_ARROWS_FRAME_MAGIC + struct.pack("<I", len(json_header)) + json_header
+            + b"".join(bodies))
+
+
+def _decode_pipe_frame(raw):
+    """Inverse of _encode_pipe_frame. Returns the response dict (with arrow
+    bodies reassembled back into the envelope so _restore_jsonable sees the
+    same shape the server built), or None if the frame is not an arrow frame
+    (caller falls back to json.loads).
+    """
+    if not _is_arrow_frame(raw):
+        return None
+    import struct
+    magic_len = len(_ARROWS_FRAME_MAGIC)
+    if len(raw) < magic_len + 4:
+        return None
+    (json_len,) = struct.unpack("<I", bytes(raw[magic_len:magic_len + 4]))
+    start = magic_len + 4
+    if len(raw) < start + json_len:
+        return None
+    response = json.loads(raw[start:start + json_len].decode("utf-8"))
+    data = response.get("data")
+    if not isinstance(data, dict) or data.get("__bigqmt_wire__") != "arrow_envelope":
+        return response
+    bodies = raw[start + json_len:]
+    frames = data.get("frames") or {}
+    for code, env in frames.items():
+        off = env.get("_offset")
+        ln = env.get("_length")
+        if off is None or ln is None:
+            continue
+        env["body"] = bytes(bodies[off:off + ln])
+        env.pop("_offset", None)
+        env.pop("_length", None)
+    return response
+
+
 # kernel32 constants (winbase.h)
 PIPE_ACCESS_DUPLEX = 0x00000003
 PIPE_TYPE_MESSAGE = 0x00000004
@@ -364,8 +469,15 @@ class NamedPipeTransport(RpcTransport):
             # that is the #195 class of bug. The caller decides on those.
             self._drop_client_handle()
             self._write(self._client_handle(), payload)
-        response = json.loads(decode_text(
-            self._read_with_watchdog(self._client_handle(), timeout_seconds)))
+        raw = self._read_with_watchdog(self._client_handle(), timeout_seconds)
+        # An arrow frame (wire_format="arrow") carries binary; a JSON frame
+        # starts with '{'. _decode_pipe_frame returns None for JSON, so the
+        # fast path (wire_format=json, the default) costs only one magic
+        # prefix check per reply.
+        decoded = _decode_pipe_frame(raw)
+        if decoded is None:
+            decoded = json.loads(decode_text(raw))
+        response = decoded
         # 串线核对（#436）：服务端延迟应答按句柄值写回，连接关闭后该值可能
         # 已被回收给新连接——旧应答可能落到本连接上。请求与响应的
         # request_id 不一致就是拿到了别人的应答；此时本连接已被污染，丢弃
@@ -582,8 +694,7 @@ class NamedPipeTransport(RpcTransport):
                                 "error": "%s: %s" % (exc.__class__.__name__, exc)}
                 if response is not None:
                     try:
-                        self._write(handle, json.dumps(
-                            response, ensure_ascii=False, default=str).encode("utf-8"))
+                        self._write(handle, _encode_pipe_frame(response))
                     except Exception:
                         self._forget_drain_handle(handle)
                         break
@@ -614,7 +725,7 @@ class NamedPipeTransport(RpcTransport):
         handle = (request or {}).get("_pipe_handle")
         if handle is None:
             raise TransportError("no pipe handle on the request to reply to")
-        payload = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
+        payload = _encode_pipe_frame(response)
         outbox = (request or {}).get("_pipe_outbox")
         if outbox is None:
             # drain 模式：没有工作线程，adjust 线程是唯一的读者也是唯一的写者，

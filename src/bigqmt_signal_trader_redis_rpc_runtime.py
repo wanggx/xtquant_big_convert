@@ -325,6 +325,12 @@ RPC_ORDER_SETTLE_TIMEOUT_SECONDS = BIGQMT_REDIS_CONFIG.get(
     "order_settle_timeout_seconds", RPC_ORDER_SETTLE_TIMEOUT_SECONDS)
 RPC_HEAVY_OFFLOAD = bool(BIGQMT_REDIS_CONFIG.get("rpc_heavy_offload", RPC_HEAVY_OFFLOAD))
 RPC_HEAVY_CODES_THRESHOLD = int(BIGQMT_REDIS_CONFIG.get("rpc_heavy_codes_threshold", RPC_HEAVY_CODES_THRESHOLD))
+# Wire encoding for big DataFrame answers: "json" (historical, default) or
+# "arrow" (Arrow IPC binary frames, ~16x faster, needs pyarrow in the sandbox;
+# auto-falls back to json). See docs/WIRE_FORMAT_BENCH.md.
+RPC_WIRE_FORMAT = str(BIGQMT_REDIS_CONFIG.get("wire_format", "json") or "json").lower()
+if RPC_WIRE_FORMAT not in ("json", "arrow"):
+    RPC_WIRE_FORMAT = "json"
 FULL_TICK_CACHE_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
 FULL_TICK_DEMAND_TTL_SECONDS = float(
     BIGQMT_REDIS_CONFIG.get("full_tick_demand_ttl_seconds", FULL_TICK_DEMAND_TTL_SECONDS)
@@ -408,6 +414,7 @@ def _apply_config(account_id):
         "drain_budget_seconds": RPC_DRAIN_BUDGET_SECONDS,
         "heavy_offload": RPC_HEAVY_OFFLOAD,
         "heavy_codes_threshold": RPC_HEAVY_CODES_THRESHOLD,
+        "wire_format": RPC_WIRE_FORMAT,
         "process_in_listener": RPC_PROCESS_IN_LISTENER,
         "listener_methods": RPC_LISTENER_METHODS,
         # Transport selection (default redis). Forwarded from the local
@@ -518,6 +525,9 @@ def configure_runtime_redis(redis_config):
         "order_settle_timeout_seconds", RPC_ORDER_SETTLE_TIMEOUT_SECONDS)
     RPC_HEAVY_OFFLOAD = bool(redis_config.get("rpc_heavy_offload", RPC_HEAVY_OFFLOAD))
     RPC_HEAVY_CODES_THRESHOLD = int(redis_config.get("rpc_heavy_codes_threshold", RPC_HEAVY_CODES_THRESHOLD))
+    RPC_WIRE_FORMAT = str(redis_config.get("wire_format", RPC_WIRE_FORMAT) or "json").lower()
+    if RPC_WIRE_FORMAT not in ("json", "arrow"):
+        RPC_WIRE_FORMAT = "json"
     FULL_TICK_CACHE_ENABLED = bool(redis_config.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
     FULL_TICK_DEMAND_TTL_SECONDS = float(
         redis_config.get("full_tick_demand_ttl_seconds", FULL_TICK_DEMAND_TTL_SECONDS)

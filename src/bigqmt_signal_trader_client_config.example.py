@@ -34,6 +34,16 @@ BIGQMT_REDIS_CONFIG = {
     # "redis" works with the standard DRYRUN; use "zmq" when the server runs
     # with transport=zmq (e.g. the no-redis version or explicit zmq mode).
     "transport": "redis",
+    # Wire encoding for big get_market_data_ex answers.
+    #   "json"  (default): the historical to_jsonable + json.dumps path. No new
+    #                      dependency, byte-identical to every prior release.
+    #   "arrow":            columnar Arrow IPC binary frames. ~16x faster on a
+    #                      60-code 40-day 5m read (see docs/WIRE_FORMAT_BENCH.md);
+    #                      needs pyarrow on BOTH the QMT server sandbox and the
+    #                      client. Falls back to json when pyarrow is absent on
+    #                      either side or the payload is not a DataFrame answer,
+    #                      so an old peer keeps working. Must match the server.
+    # "wire_format": "json",
     # ZMQ-specific settings (only used when transport=zmq):
     # "zmq": {
     #     # Explicit connect address. The QMT-side server binds a port derived

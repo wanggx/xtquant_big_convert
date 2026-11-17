@@ -571,6 +571,117 @@ def to_jsonable(value):
     return str(value)
 
 
+# --------------------------------------------------------------------------
+# Arrow IPC wire encoding (wire_format="arrow"). See docs/WIRE_FORMAT_BENCH.md:
+# ~16x faster than the JSON records path on a 60-code 40-day 5m read. The
+# server encodes DataFrame answers to Arrow IPC bytes; the client decodes
+# them back with pyarrow.ipc.open_stream().read_pandas(). Pure-scalar / small
+# answers stay on JSON (to_jsonable) so the binary path never pays overhead
+# where it cannot win and never breaks a non-DataFrame answer.
+#
+# A frame is encoded as: json header (columns, dtypes, n_rows) + NUL + Arrow
+# IPC bytes. A {code: df} answer becomes {code: {"__bigqmt_wire__": "arrow",
+# "header": ..., "body": <bytes>}}. The transport layer carries the bytes;
+# json.dumps would choke on the bytes, so _publish_response / pipe write
+# route an arrow-bearing response over the binary frame path, not json.
+# --------------------------------------------------------------------------
+
+_ARROW_HEADER_SEP = b"\x00"
+
+
+def _pyarrow_available():
+    """True when pyarrow imports AND a Table->IPC->Table round-trip works.
+
+    Import alone is not enough: the sandbox whitelist may let the module
+    load but block the C-extension calls (ipc.new_stream / open_stream). The
+    probe run in the QMT terminal (2026-11-17) confirmed both import and
+    round-trip work on the target build, but other brokers may differ, so
+    every encode attempt re-validates and falls back to json on any failure.
+    """
+    try:
+        import pyarrow as pa  # noqa: F401
+        import pyarrow.ipc as ipc  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _arrow_encode_frame(df):
+    """One DataFrame -> (header_dict, arrow_ipc_bytes), or None on failure.
+
+    Returns None (not raises) so the caller falls back to JSON without a
+    try/except stack to unwind -- the whole point of the fallback design.
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+        # to_jsonable did reset_index(); match it by preserving a named index
+        # as a column so the client rebuilds identically. An unnamed default
+        # RangeIndex carries nothing and is dropped (preserve_index=False).
+        idx_name = getattr(df.index, "name", None)
+        preserve = idx_name is not None
+        table = pa.Table.from_pandas(df, preserve_index=preserve)
+        sink = pa.BufferOutputStream()
+        with ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        body = sink.getvalue().to_pybytes()
+        header = {
+            "columns": [str(c) for c in table.column_names],
+            "dtypes": [str(table.column(c).type) for c in table.column_names],
+            "n_rows": int(len(df)),
+        }
+        if preserve:
+            header["index_name"] = str(idx_name)
+        return header, body
+    except Exception:
+        return None
+
+
+def _arrow_encode_envelope(result, min_rows=1000):
+    """Encode a market-data answer to the Arrow wire envelope, or None.
+
+    Returns None when the result is not worth a binary frame: not a dict of
+    DataFrames, too few rows, or pyarrow unavailable. ``min_rows`` is the
+    threshold below which JSON stays cheaper than the Arrow header overhead
+    (the benchmark shows Arrow wins clearly above ~1000 rows; below it the
+    fixed encode/decode cost can exceed the JSON saving).
+
+    The envelope carries bytes, so the caller MUST NOT json.dumps it -- the
+    transport layer serializes an arrow-bearing response over the binary
+    frame path. A None return means "use to_jsonable + json as before".
+    """
+    if not _pyarrow_available():
+        return None
+    if not isinstance(result, dict) or not result:
+        return None
+    # Only {code: DataFrame} answers (get_market_data_ex shape) are worth a
+    # binary frame. A bare DataFrame (some RPC methods return one) is left to
+    # the JSON path -- to_jsonable wraps it in a DataFrame envelope and the
+    # client rebuilds it directly; arrow would need a synthetic-key wrap that
+    # the JSON path does not do, so keeping bare frames on JSON stays consistent.
+    frames = {}
+    for key, value in result.items():
+        if hasattr(value, "columns") and hasattr(value, "index"):
+            frames[str(key)] = value
+    if not frames:
+        return None
+    total_rows = sum(len(df) for df in frames.values())
+    if total_rows < min_rows:
+        return None
+    encoded = {}
+    for key, df in frames.items():
+        enc = _arrow_encode_frame(df)
+        if enc is None:
+            return None  # one frame fails -> whole answer falls back to json
+        header, body = enc
+        encoded[key] = {
+            "__bigqmt_wire__": "arrow",
+            "header": header,
+            "body": body,
+        }
+    return {"__bigqmt_wire__": "arrow_envelope", "frames": encoded}
+
+
 def _rows_for_this_submit(orders, remark, stock_code, action, submitted_at):
     """The order rows that can be THIS submit's, earliest first.
 
@@ -3803,8 +3914,14 @@ class RedisPubSubRpcService:
         slow_request_seconds=1.0,
         heavy_offload=True,
         heavy_codes_threshold=HEAVY_READ_CODES_THRESHOLD,
+        wire_format="json",
     ):
         self.listen_redis = redis_client
+        # Wire encoding for big DataFrame answers: "json" (historical) or
+        # "arrow" (Arrow IPC binary, needs pyarrow in the sandbox; falls back
+        # to json). Read by _build_response / _encode_response_data.
+        wf = str(wire_format or "json").lower()
+        self.wire_format = wf if wf in ("json", "arrow") else "json"
         # Heavy reads leave the adjust thread for one worker (#351). Only in
         # the adjust drain: with background threads the receive thread already
         # runs them off the strategy thread. See HEAVY_READ_METHODS.
@@ -4285,7 +4402,8 @@ class RedisPubSubRpcService:
                 self._pending_settlements.put(settlement)
                 continue
             response = settlement.response
-            response["data"] = to_jsonable(settlement.result)
+            response["data"], response["_wire"] = self._encode_response_data(
+                settlement.result)
             response["ok"] = True
             if getattr(settlement, "server_error", ""):
                 response["server_error"] = settlement.server_error
@@ -4617,11 +4735,14 @@ class RedisPubSubRpcService:
             finally:
                 _t1 = time.perf_counter()
                 self._note_slow_request(method, _t1 - _t0)
-            response["data"] = to_jsonable(result)
+            response["data"], response["_wire"] = self._encode_response_data(result)
             # to_jsonable is where a big answer burns its time (#386: 12.7MB
             # of 5m bars took ~11s here on the serve side while the handler
             # itself was fast, and nothing logged it -- the slow-request note
-            # covers only the handler segment).
+            # covers only the handler segment). wire_format="arrow" moves that
+            # time to a memcpy-level Arrow IPC encode (~16x faster); "_wire"
+            # tells _publish_response whether to json.dumps or send a binary
+            # frame.
             _t_json1 = time.perf_counter()
             response["ok"] = True
             # Surface server-side diagnostics when the handler recorded one.
@@ -4667,7 +4788,8 @@ class RedisPubSubRpcService:
             except Exception:
                 pass
         _t_pub1 = time.perf_counter()
-        self._note_slow_response(method, _t0, _t1, _t_json1, _t_pub0, _t_pub1)
+        self._note_slow_response(method, _t0, _t1, _t_json1, _t_pub0, _t_pub1,
+                                 wire=response.get("_wire") or "json")
         if method == "ping":
             # Logged AFTER publish: this print goes to the QMT output panel,
             # which costs ~1 adjust tick of GIL wait on the serving thread --
@@ -4675,9 +4797,11 @@ class RedisPubSubRpcService:
             # by ~100ms and made the breakdown lie (#104).
             try:
                 from .logging_setup import get_logger
+                _ping_label = "arrow_encode" if response.get("_wire") == "arrow" else "jsonable"
                 get_logger("rpc").info(
-                    "ping breakdown handle=%.1fms jsonable=%.1fms publish=%.1fms",
+                    "ping breakdown handle=%.1fms %s=%.1fms publish=%.1fms",
                     (_t1 - _t0) * 1000.0,
+                    _ping_label,
                     (_t_pub0 - _t1) * 1000.0,
                     (time.perf_counter() - _t_pub0) * 1000.0)
             except Exception:
@@ -4686,6 +4810,34 @@ class RedisPubSubRpcService:
         if self._processed_count <= self.debug_log_limit:
             print("%s responded method=%s ok=%s" % (self.print_prefix, method, response["ok"]))
         return response
+
+    def _encode_response_data(self, result):
+        """Encode the handler result for the wire, honouring wire_format.
+
+        wire_format="json" (default): the historical to_jsonable path, byte
+        for byte what every prior release sent.
+
+        wire_format="arrow": try Arrow IPC for DataFrame answers (16x faster,
+        see docs/WIRE_FORMAT_BENCH.md). Falls back to json when pyarrow is
+        absent, the result is not a DataFrame answer, it is too small to be
+        worth a binary frame, the transport is not pipe (only pipe carries
+        raw binary frames today; redis/zmq json.dumps would choke on the
+        bytes), or any encode step raises -- so an arrow config never breaks
+        a non-pyarrow sandbox, a small/scalar answer, or a redis/zmq wire.
+
+        An arrow-bearing response carries bytes and is serialized by the pipe
+        transport over its binary frame path, not json.dumps; the pipe
+        transport recognises the ``__bigqmt_wire__`` marker.
+        """
+        if self.wire_format != "arrow":
+            return to_jsonable(result), "json"
+        transport_name = getattr(getattr(self, "_transport", None), "name", "")
+        if transport_name != "pipe":
+            return to_jsonable(result), "json"
+        encoded = _arrow_encode_envelope(result)
+        if encoded is None:
+            return to_jsonable(result), "json"
+        return encoded, "arrow"
 
     def _note_slow_request(self, method, seconds):
         """Name a handler that held its thread for ``slow_request_seconds``.
@@ -4714,16 +4866,23 @@ class RedisPubSubRpcService:
             pass
 
     def _note_slow_response(self, method, t_handle0, t_handle1, t_json_done,
-                            t_pub0, t_pub1):
+                            t_pub0, t_pub1, wire="json"):
         """Segmented slow note for the time AROUND the handler (#386).
 
         The handler-level note above covers only ``handlers.handle``; a big
-        answer then burns its real time in ``to_jsonable`` and the publish,
+        answer then burns its real time in the reply encoding and the publish,
         neither of which any log named -- a 60-code 40-day 5m read spent
         ~11.5s server-side with zero slow lines. Fires only when the TOTAL
         exceeds ``slow_request_seconds`` while the handler segment alone did
         not (otherwise the handler note already named it). Never raises:
         this runs on the adjust thread too.
+
+        ``wire`` names the encode stage honestly: "to_jsonable" for the JSON
+        path, "arrow_encode" for the Arrow IPC path. The segment times the
+        same code region either way (handler end -> encode end); the label
+        tells the reader which encoder ran, so an arrow-enabled deployment
+        does not mislead with a "to_jsonable=0.7s" line that was actually
+        Arrow IPC.
         """
         if t_handle0 is None or t_handle1 is None:
             return
@@ -4737,8 +4896,9 @@ class RedisPubSubRpcService:
         total = t_pub1 - t_handle0
         if total < threshold or handle >= threshold:
             return
-        jsonable = (t_json_done - t_handle1) if t_json_done is not None else -1.0
+        encode = (t_json_done - t_handle1) if t_json_done is not None else -1.0
         publish = t_pub1 - t_pub0
+        encode_label = "arrow_encode" if wire == "arrow" else "to_jsonable"
         try:
             thread_name = threading.current_thread().name
         except Exception:
@@ -4747,10 +4907,11 @@ class RedisPubSubRpcService:
             from .logging_setup import get_logger
             get_logger("rpc").warning(
                 "slow response method=%s total=%.1fs handle=%.1fs "
-                "to_jsonable=%.1fs publish=%.1fs thread=%s (#386: the slow "
+                "%s=%.1fs publish=%.1fs thread=%s wire=%s (#386: the slow "
                 "part is the reply conversion/send, not the handler -- "
                 "consider chunk_size or a narrower window)",
-                method, total, handle, jsonable, publish, thread_name)
+                method, total, handle, encode_label, encode, publish,
+                thread_name, wire)
         except Exception:
             pass
 
