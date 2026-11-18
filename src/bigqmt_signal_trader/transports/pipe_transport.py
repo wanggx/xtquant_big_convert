@@ -182,6 +182,7 @@ ERROR_OPERATION_ABORTED = 995
 ERROR_INVALID_HANDLE = 6
 ERROR_BROKEN_PIPE = 109
 ERROR_FILE_NOT_FOUND = 2
+ERROR_ACCESS_DENIED = 5
 
 _BUFFER_BYTES = 1 << 20      # 1MB: whole-market quote frames are large
 _CONNECT_POLL_SECONDS = 0.05
@@ -206,6 +207,66 @@ def _kernel32():
     # drain 模式要用它做非阻塞探测：有数据才 ReadFile，绝不在 adjust 线程上阻塞
     dll.PeekNamedPipe.restype = bool_type
     return dll, wintypes
+
+
+# QMT 常以管理员（High IL）启动；默认 CreateNamedPipe 会把管道打成 High IL，
+# 同机普通权限（Medium IL）的 vnpy CreateFile 就会 ACCESS_DENIED (err=5)，
+# 管道明明存在却连不上。SDDL：本机已登录用户可读写 + Medium 强制完整性标签。
+_PIPE_SDDL_SAME_HOST = (
+    "D:(A;;GA;;;AU)(A;;GA;;;BA)(A;;GA;;;SY)S:(ML;;NW;;;ME)"
+)
+
+
+def _pipe_security_attributes():
+    """Build SECURITY_ATTRIBUTES for same-host clients (any local user).
+
+    Returns ``(sa_or_None, sd_to_LocalFree_or_None)``. On any failure the
+    caller passes ``None`` to CreateNamedPipeW (historical default ACL).
+    The security descriptor is copied into the pipe object at create time,
+    so LocalFree after CreateNamedPipeW returns.
+    """
+    if os.name != "nt":
+        return None, None
+    try:
+        from ctypes import wintypes
+    except Exception:
+        return None, None
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", getattr(wintypes, "BOOL", ctypes.c_int32)),
+        ]
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    convert = advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [
+        ctypes.c_wchar_p,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    convert.restype = getattr(wintypes, "BOOL", ctypes.c_int32)
+
+    sd = ctypes.c_void_p()
+    # SDDL_REVISION_1 == 1
+    if not convert(_PIPE_SDDL_SAME_HOST, 1, ctypes.byref(sd), None):
+        return None, None
+    sa = SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+    sa.lpSecurityDescriptor = sd
+    sa.bInheritHandle = 0
+    return sa, sd
+
+
+def _free_security_descriptor(sd):
+    if not sd:
+        return
+    try:
+        ctypes.WinDLL("kernel32").LocalFree(sd)
+    except Exception:
+        pass
 
 
 def pipe_path(name=DEFAULT_PIPE_NAME, account_id=""):
@@ -369,9 +430,18 @@ class NamedPipeTransport(RpcTransport):
             # Retrying it is exactly as legitimate as retrying PIPE_BUSY.
             if err not in (ERROR_PIPE_BUSY, ERROR_FILE_NOT_FOUND) \
                     or time.time() >= deadline:
+                hint = (
+                    "Is the QMT-side strategy running with transport=pipe?"
+                )
+                if err == ERROR_ACCESS_DENIED:
+                    hint = (
+                        "err=5 ACCESS_DENIED: pipe exists but ACL/integrity "
+                        "blocked this process. Redeploy a bridge that creates "
+                        "the pipe with same-host SDDL, or run the client "
+                        "elevated to match an old High-IL pipe."
+                    )
                 raise TransportError(
-                    "cannot connect to %s (err=%s). Is the QMT-side strategy "
-                    "running with transport=pipe?" % (self.path, err))
+                    "cannot connect to %s (err=%s). %s" % (self.path, err, hint))
             time.sleep(_CONNECT_POLL_SECONDS)
         mode = self._wintypes.DWORD(PIPE_READMODE_MESSAGE)
         dll.SetNamedPipeHandleState(handle, ctypes.byref(mode), None, None)
@@ -561,10 +631,15 @@ class NamedPipeTransport(RpcTransport):
     def _accept_loop(self):
         dll = self._dll()
         while self._running:
-            handle = dll.CreateNamedPipeW(
-                self.path, PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0, None)
+            sa, sd = _pipe_security_attributes()
+            try:
+                handle = dll.CreateNamedPipeW(
+                    self.path, PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0,
+                    ctypes.byref(sa) if sa is not None else None)
+            finally:
+                _free_security_descriptor(sd)
             if handle == INVALID_HANDLE_VALUE:
                 if not self._running:
                     return

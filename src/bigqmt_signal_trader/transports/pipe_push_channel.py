@@ -26,7 +26,9 @@ import time
 from .pipe_transport import (
     _BUFFER_BYTES,
     _CONNECT_POLL_SECONDS,
+    _free_security_descriptor,
     _kernel32,
+    _pipe_security_attributes,
     pipe_path,
     DEFAULT_PIPE_NAME,
     ERROR_BROKEN_PIPE,
@@ -97,10 +99,16 @@ class PipeQuotePushChannel(object):
             # (message read mode) needs GENERIC_WRITE on its handle, and an
             # OUTBOUND pipe refuses that with ACCESS_DENIED (err=5). The wire
             # is still one-directional in practice -- clients never write.
-            handle = dll.CreateNamedPipeW(
-                self.bind_address, PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0, None)
+            # Same-host SDDL: QMT High IL must not lock out Medium-IL vnpy.
+            sa, sd = _pipe_security_attributes()
+            try:
+                handle = dll.CreateNamedPipeW(
+                    self.bind_address, PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0,
+                    ctypes.byref(sa) if sa is not None else None)
+            finally:
+                _free_security_descriptor(sd)
             if handle == INVALID_HANDLE_VALUE:
                 if not self._running:
                     return

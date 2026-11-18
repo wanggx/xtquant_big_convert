@@ -128,7 +128,9 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     BIGQMT_REDIS_CONFIG.setdefault("download_jobs_enabled", False)
     BIGQMT_REDIS_CONFIG.setdefault("full_tick_cache_enabled", False)
     print("[bigqmt_shell] pipe mode: transport=pipe background_threads=%s "
-          "redis_enabled=False quote_push=False" % BIGQMT_REDIS_CONFIG["rpc_background_threads"])''')
+          "redis_enabled=False quote_push=False wire_format=%s"
+          % (BIGQMT_REDIS_CONFIG["rpc_background_threads"],
+             BIGQMT_REDIS_CONFIG.get("wire_format", "arrow")))''')
 
 assert "transport=pipe" in PIPE_TEMPLATE and '"transport": "pipe",' in PIPE_TEMPLATE, \
     "template replacements did not land"
