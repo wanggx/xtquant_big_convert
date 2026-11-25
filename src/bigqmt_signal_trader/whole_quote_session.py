@@ -42,6 +42,9 @@ class WholeQuoteClientSession(object):
         self._subscriber_active = False
         self._subscribed_topics = frozenset()  # topic set the subscriber covers now
         self._heartbeat_thread = None
+        # stop() sets this so the heartbeat leaves sleep immediately instead of
+        # blocking close for up to join(timeout=1s) while sleeping the interval.
+        self._stop_event = threading.Event()
         self._last_push_time = None  # monotonic time of last incoming push
         self._replay_pending = False  # a failed batch must finish despite other subscriptions pushing
 
@@ -163,6 +166,7 @@ class WholeQuoteClientSession(object):
             # stayed True (#231) -- "started" must mean "a live thread",
             # otherwise start() never recovers it.
             self._started = True
+            self._stop_event.clear()
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop, name="bigqmt-quote-keepalive", daemon=True
             )
@@ -171,28 +175,29 @@ class WholeQuoteClientSession(object):
     def stop(self):
         with self._lock:
             self._started = False
+        self._stop_event.set()
         thread = self._heartbeat_thread
         if thread is not None:
             thread.join(timeout=1.0)
         self._heartbeat_thread = None
 
     def _heartbeat_loop(self):
-        import time
-
         consecutive_failures = 0
         silence_rounds = 0
         prev_last_push = None
-        while True:
+        while not self._stop_event.is_set():
             with self._lock:
                 if not self._started:
                     return
                 sub_ids = list(self._subscriptions.keys())
                 last_push = self._last_push_time
             if not sub_ids:
-                time.sleep(self._heartbeat_interval)
+                self._stop_event.wait(self._heartbeat_interval)
                 continue
             failures = 0
             for sub_id in sub_ids:
+                if self._stop_event.is_set():
+                    return
                 try:
                     self._rpc("quote_keepalive", {"client_id": self.client_id, "sub_id": sub_id})
                 except Exception:
@@ -222,7 +227,7 @@ class WholeQuoteClientSession(object):
                 except Exception:
                     pass
                 silence_rounds = 0
-            time.sleep(self._heartbeat_interval)
+            self._stop_event.wait(self._heartbeat_interval)
 
     # -- push routing ------------------------------------------------------------
     def _on_push(self, topic, data):

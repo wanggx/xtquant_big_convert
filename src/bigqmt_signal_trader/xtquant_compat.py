@@ -2214,6 +2214,22 @@ class BigQmtXtData:
         self._quote_session_factory = None  # test hook: returns a session-like object
         self._bar_pollers = {}              # seq -> _BarPoller, for K-line periods
         self._bar_poller_lock = threading.Lock()
+        # Optional sink (e.g. vnpy gateway.write_log) for subscribe timing lines
+        self._log_func = None
+
+    def set_log_func(self, func) -> None:
+        """Route informational lines to the host (vnpy ``write_log``)."""
+        self._log_func = func
+
+    def _emit_log(self, msg: str) -> None:
+        func = self._log_func
+        if callable(func):
+            try:
+                func(msg)
+                return
+            except Exception:
+                pass
+        log.warning("%s", msg)
 
     def _next_seq(self):
         self._subscribe_seq += 1
@@ -3452,17 +3468,68 @@ class BigQmtXtData:
         }
 
         if str(period).lower() in ("tick", "full_tick"):
+            # 分段计时：定位 subscribe_whole_quote / get_full_tick / callback 哪步慢
+            t0 = time.perf_counter()
+            self._emit_log("行情订阅计时：%s 开始" % stock_code)
+
+            t1 = time.perf_counter()
             session = self._whole_quote_session()
             session.start()
+            self._emit_log(
+                "行情订阅计时：%s session 就绪 %.3fs" % (
+                    stock_code, time.perf_counter() - t1,
+                )
+            )
+
+            t2 = time.perf_counter()
+            self._emit_log(
+                "行情订阅计时：%s 即将 subscribe_whole_quote" % stock_code
+            )
             seq = session.subscribe_whole_quote([stock_code], callback=callback)
+            self._emit_log(
+                "行情订阅计时：%s subscribe_whole_quote 返回 id=%s 耗时 %.3fs" % (
+                    stock_code, seq, time.perf_counter() - t2,
+                )
+            )
+
             # The whole-quote callback is incremental; prime it with a snapshot
             # so a subscriber is not left with nothing until the first change.
             if callback is not None:
                 try:
-                    callback(self.get_full_tick([stock_code]))
-                except Exception:
-                    pass
+                    t3 = time.perf_counter()
+                    self._emit_log(
+                        "行情订阅计时：%s 即将 get_full_tick 首帧" % stock_code
+                    )
+                    ticks = self.get_full_tick([stock_code])
+                    self._emit_log(
+                        "行情订阅计时：%s get_full_tick 返回 n=%s 耗时 %.3fs" % (
+                            stock_code,
+                            len(ticks) if isinstance(ticks, dict) else -1,
+                            time.perf_counter() - t3,
+                        )
+                    )
+                    t4 = time.perf_counter()
+                    self._emit_log(
+                        "行情订阅计时：%s 即将 callback 首帧" % stock_code
+                    )
+                    callback(ticks)
+                    self._emit_log(
+                        "行情订阅计时：%s callback 结束 耗时 %.3fs" % (
+                            stock_code, time.perf_counter() - t4,
+                        )
+                    )
+                except Exception as exc:
+                    self._emit_log(
+                        "行情订阅计时：%s prime/callback 异常 %s: %s" % (
+                            stock_code, type(exc).__name__, exc,
+                        )
+                    )
             self._record_subscription(seq, payload)
+            self._emit_log(
+                "行情订阅计时：%s 合计 %.3fs" % (
+                    stock_code, time.perf_counter() - t0,
+                )
+            )
             return seq
 
         seq = self._next_seq()
@@ -3503,8 +3570,13 @@ class BigQmtXtData:
 
     def _record_subscription(self, seq, payload, active=True):
         """Bookkeeping only -- nothing on the server consumes it, and it needs a
-        Redis client, which a zmq deployment does not have. Never let it break
-        an otherwise working subscription."""
+        Redis client. Never let it break an otherwise working subscription.
+
+        Pipe transport has no Redis: skip so each subscribe does not dial
+        Redis and stall ~45–50s. Other transports keep the bookkeeping.
+        """
+        if self.client.transport_name == "pipe":
+            return
         try:
             self.client.save_quote_subscription(seq, dict(payload, seq=seq), active=active)
             self.client.publish_event(
